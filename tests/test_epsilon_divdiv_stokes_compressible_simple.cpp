@@ -620,7 +620,8 @@ std::tuple< double, double, int >
         fine_level_velocity );
 
 
-    linalg::apply( inv_rho_grad_rho_dot_u_form, tala_term );
+    // linalg::apply( inv_rho_grad_rho_dot_u_form, tala_term );
+    linalg::apply( inv_radial_rho_grad_rho_dot_u_form, tala_term );
 
     using InvRhoDrhoDtForm = fe::wedge::linearforms::shell::InvRhoDrhoDt< double >;
 
@@ -891,7 +892,7 @@ int main( int argc, char** argv )
     MPI_Init( &argc, &argv );
     Kokkos::ScopeGuard scope_guard( argc, argv );
 
-    const int max_level = 3;
+    const int max_level = 2;
     auto      table     = std::make_shared< util::Table >();
 
     std::vector< int > gcas = { 0 };
@@ -904,7 +905,7 @@ int main( int argc, char** argv )
     std::map< int, std::map< int, double > > err_vel;
     std::map< int, std::map< int, double > > err_pre;
 
-    for ( int minlevel = 2; minlevel <= 2; ++minlevel )
+    for ( int minlevel = 1; minlevel <= 1; ++minlevel )
     {
         util::logroot << "minlevel = " << minlevel << "\n";
 
