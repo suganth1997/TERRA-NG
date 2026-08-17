@@ -240,6 +240,38 @@ struct RhoInterpolator
     }
 };
 
+// struct RhoRadialInterpolator
+// {
+//     Grid3DDataVec< double, 3 > grid_;
+//     Grid2DDataScalar< double > radii_;
+//     Grid2DDataScalar< double > data_;
+
+//     RhoRadialInterpolator(
+//         const Grid3DDataVec< double, 3 >& grid,
+//         const Grid2DDataScalar< double >& radii,
+//         const Grid2DDataScalar< double >& data )
+//     : grid_( grid )
+//     , radii_( radii )
+//     , data_( data )
+//     {}
+
+//     KOKKOS_INLINE_FUNCTION
+//     void operator()( const int local_subdomain_id, const int x_idx, const int y_idx, const int r_idx ) const
+//     {
+//         if ( SETUP == 1 )
+//         {
+//             data_( local_subdomain_id, x_idx, y_idx, r_idx ) = 1.0;
+//         }
+//         else
+//         {
+//             const dense::Vec< double, 3 > coords =
+//                 grid::shell::coords( local_subdomain_id, x_idx, y_idx, r_idx, grid_, radii_ );
+//             const double r                                   = coords.norm();
+//             data_( local_subdomain_id, r_idx ) = r;
+//         }
+//     }
+// };
+
 struct DRhoDtInterpolator
 {
     Grid3DDataVec< double, 3 > grid_;
@@ -503,6 +535,33 @@ std::tuple< double, double, int >
     // auto& rho     = stok_vecs["tmp_3"].block_2();
     // auto& drho_dt = stok_vecs["tmp_4"].block_2();
 
+    grid::Grid2DDataScalar< double > rhoRadial( "rhoRadial", domains[velocity_level].subdomains().size(), domains[velocity_level].domain_info().subdomain_num_nodes_radially() );
+
+    {
+        const int shells_per_subdomain = domains[velocity_level].domain_info().subdomain_num_nodes_radially();
+        const int layers_per_subdomain = shells_per_subdomain - 1;
+
+        // Grid2DDataScalar< T > radii_device( "subdomain_shell_radii", domain.subdomains().size(), shells_per_subdomain );
+        typename Grid2DDataScalar< double >::host_mirror_type rho_host = Kokkos::create_mirror_view( rhoRadial );
+
+        for ( const auto& [subdomain_info, data] : domains[velocity_level].subdomains() )
+        {
+            const auto& [subdomain_idx, neighborhood] = data;
+
+            const int subdomain_innermost_node_idx = subdomain_info.subdomain_r() * layers_per_subdomain;
+            const int subdomain_outermost_node_idx = subdomain_innermost_node_idx + layers_per_subdomain;
+
+            int j = 0;
+            for ( int node_idx = subdomain_innermost_node_idx; node_idx <= subdomain_outermost_node_idx; node_idx++ )
+            {
+                rho_host( subdomain_idx, j ) = domains[velocity_level].domain_info().radii()[node_idx];
+                j++;
+            }
+        }
+
+        Kokkos::deep_copy( rhoRadial, rho_host );
+    }
+
     VectorQ1Scalar< double > rho( "rho", domains[velocity_level], mask_data[velocity_level] );
     VectorQ1Scalar< double > drho_dt( "drho_dt", domains[velocity_level], mask_data[velocity_level] );
 
@@ -535,7 +594,7 @@ std::tuple< double, double, int >
     auto& tala_term           = stok_vecs["tmp_1"].block_2();
     auto& pda_additional_term = stok_vecs["tmp_2"].block_2();
 
-    using InvRhoGradRhoDotUForm = fe::wedge::linearforms::shell::InvRhoGradRhoDotU< double >;
+    using InvRhoGradRhoDotUForm = fe::wedge::linearforms::shell::InvRhoGradRhoDotU< double, grid::Grid4DDataScalar< double > >;
 
     InvRhoGradRhoDotUForm inv_rho_grad_rho_dot_u_form(
         domains[pressure_level],
@@ -544,8 +603,22 @@ std::tuple< double, double, int >
         coords_shell[velocity_level],
         coords_radii[pressure_level],
         coords_radii[velocity_level],
-        rho,
+        rho.grid_data(),
         fine_level_velocity );
+
+
+    using InvRadialRhoGradRhoDotUForm = fe::wedge::linearforms::shell::InvRhoGradRhoDotU< double, grid::Grid2DDataScalar< double > >;
+
+    InvRadialRhoGradRhoDotUForm inv_radial_rho_grad_rho_dot_u_form(
+        domains[pressure_level],
+        domains[velocity_level],
+        coords_shell[pressure_level],
+        coords_shell[velocity_level],
+        coords_radii[pressure_level],
+        coords_radii[velocity_level],
+        rhoRadial,
+        fine_level_velocity );
+
 
     linalg::apply( inv_rho_grad_rho_dot_u_form, tala_term );
 
@@ -818,7 +891,7 @@ int main( int argc, char** argv )
     MPI_Init( &argc, &argv );
     Kokkos::ScopeGuard scope_guard( argc, argv );
 
-    const int max_level = 6;
+    const int max_level = 3;
     auto      table     = std::make_shared< util::Table >();
 
     std::vector< int > gcas = { 0 };
