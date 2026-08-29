@@ -330,7 +330,7 @@ class PlateVelocityProvider
     double getMinAge() const { return plateTopologies_.getMinAge(); }
     double getMaxAge() const { return plateTopologies_.getMaxAge(); }
 
-  private:
+//   private:
     PlateStorage          plateTopologies_;
     PlateRotationProvider plateRotations_;
 };
