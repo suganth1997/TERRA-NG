@@ -13,15 +13,16 @@
 #include "terra/fe/wedge/kernel_helpers.hpp"
 // clang-format on
 #include "terra/dense/mat.hpp"
+#include "terra/fe/wedge/operators/shell/mass.hpp"
 #include "terra/grid/shell/spherical_shell.hpp"
 #include "terra/io/xdmf.hpp"
-#include "terra/linalg/solvers/iterative_solver_info.hpp"
-#include "terra/fe/wedge/operators/shell/mass.hpp"
-#include "terra/linalg/solvers/pcg.hpp"
 #include "terra/kernels/common/grid_operations.hpp"
-#include "terra/util/table.hpp"
 #include "terra/kokkos/kokkos_wrapper.hpp"
+#include "terra/linalg/solvers/iterative_solver_info.hpp"
+#include "terra/linalg/solvers/pcg.hpp"
 #include "terra/linalg/vector_q1.hpp"
+#include "terra/mpi/mpi.hpp"
+#include "terra/util/table.hpp"
 #include "util/init.hpp"
 
 using namespace terra;
@@ -238,10 +239,75 @@ bool isPointInSphericalTriangle(
 }
 
 KOKKOS_INLINE_FUNCTION
-dense::Vec< int, 4 > queryDiamondLookup(
+dense::Vec< double, 2 > coordsIdxToUV( const Grid3DDataVec< double, 3 > points, int i_sub, int N, int i, int j )
+{
+    Vec3 V00{ points( i_sub, 0, 0, 0 ), points( i_sub, 0, 0, 1 ), points( i_sub, 0, 0, 2 ) };
+    Vec3 V01{ points( i_sub, 0, N, 0 ), points( i_sub, 0, N, 1 ), points( i_sub, 0, N, 2 ) };
+    Vec3 V10{ points( i_sub, N, 0, 0 ), points( i_sub, N, 0, 1 ), points( i_sub, N, 0, 2 ) };
+    Vec3 V11{ points( i_sub, N, N, 0 ), points( i_sub, N, N, 1 ), points( i_sub, N, N, 2 ) };
+
+    double u{}, v{};
+
+    Vec3 point{ points( i_sub, i, j, 0 ), points( i_sub, i, j, 1 ), points( i_sub, i, j, 2 ) };
+
+    diamondPointToUV( V00, V10, V01, V11, point, u, v );
+
+    return { u, v };
+}
+
+KOKKOS_INLINE_FUNCTION
+bool subdomain_lookup(
+    const Grid3DDataVec< double, 3 > grid,
+    int                              N,
+    const Grid2DDataScalar< double > radii,
+    int                              N_rad,
+    int                              num_subdomains,
+    const Vec3                       point,
+    const double                     point_radius,
+    int&                             i_subdomain,
+    double                           tol = 1e-9 )
+{
+    i_subdomain = -1;
+
+    for ( int i = 0; i < num_subdomains; ++i )
+    {
+        dense::Vec< ScalarT, 3 > subdomain_extent[4];
+
+        subdomain_extent[0]( 0 ) = grid( i, 0, 0, 0 );
+        subdomain_extent[0]( 1 ) = grid( i, 0, 0, 1 );
+        subdomain_extent[0]( 2 ) = grid( i, 0, 0, 2 );
+
+        subdomain_extent[1]( 0 ) = grid( i, N, 0, 0 );
+        subdomain_extent[1]( 1 ) = grid( i, N, 0, 1 );
+        subdomain_extent[1]( 2 ) = grid( i, N, 0, 2 );
+
+        subdomain_extent[2]( 0 ) = grid( i, N, N, 0 );
+        subdomain_extent[2]( 1 ) = grid( i, N, N, 1 );
+        subdomain_extent[2]( 2 ) = grid( i, N, N, 2 );
+
+        subdomain_extent[3]( 0 ) = grid( i, 0, N, 0 );
+        subdomain_extent[3]( 1 ) = grid( i, 0, N, 1 );
+        subdomain_extent[3]( 2 ) = grid( i, 0, N, 2 );
+
+        auto subdomain_centroid = sphericalDiamondCentroid( subdomain_extent );
+
+        bool point_in_subdomain_surf = isPointInSphericalPolygon( subdomain_extent, subdomain_centroid, point );
+        bool point_in_subdomain_radii =
+            ( point_radius >= radii( i, 0 ) - tol && point_radius <= radii( i, N_rad ) + tol );
+
+        if ( point_in_subdomain_surf && point_in_subdomain_radii )
+        {
+            i_subdomain = i;
+            return true; // Found
+        }
+    }
+
+    return false; // Not found
+}
+
+KOKKOS_INLINE_FUNCTION
+dense::Vec< int, 4 > subdomain_cell_id_lookup(
     const Grid3DDataVec< double, 3 > coords,
-    const Grid3DDataScalar< double > u_grid,
-    const Grid3DDataScalar< double > v_grid,
     int                              i_subdomain,
     const Vec3                       P,
     int                              N,
@@ -258,8 +324,10 @@ dense::Vec< int, 4 > queryDiamondLookup(
     int seed_i = Kokkos::clamp( (int) Kokkos::floor( u * N ), 0, N );
     int seed_j = Kokkos::clamp( (int) Kokkos::floor( v * N ), 0, N );
 
+    auto uv_seed = coordsIdxToUV( coords, i_subdomain, N, seed_i, seed_j );
+
     int    best_i = seed_i, best_j = seed_j;
-    double du0 = u_grid( i_subdomain, seed_i, seed_j ) - u, dv0 = v_grid( i_subdomain, seed_i, seed_j ) - v;
+    double du0 = uv_seed( 0 ) - u, dv0 = uv_seed( 1 ) - v;
     double best_d2 = du0 * du0 + dv0 * dv0;
 
     if ( !conversion )
@@ -274,8 +342,11 @@ dense::Vec< int, 4 > queryDiamondLookup(
             int ci = seed_i + di, cj = seed_j + dj;
             if ( ci < 0 || ci > N || cj < 0 || cj > N )
                 continue;
-            double du = u_grid( i_subdomain, ci, cj ) - u;
-            double dv = v_grid( i_subdomain, ci, cj ) - v;
+
+            auto uv_cij = coordsIdxToUV( coords, i_subdomain, N, ci, cj );
+
+            double du = uv_cij( 0 ) - u;
+            double dv = uv_cij( 1 ) - v;
             double d2 = du * du + dv * dv;
             if ( d2 < best_d2 )
             {
@@ -361,7 +432,7 @@ int find_interval( const Grid2DDataScalar< double >& arr, const int n, int i_sub
 }
 
 template < typename ScalarT = double >
-struct TestCellInterpolator
+struct TestParticleSteppingKernel
 {
     uint_t num_subdomains_;
     uint_t num_nodes_radially_;
@@ -370,18 +441,17 @@ struct TestCellInterpolator
     grid::Grid3DDataVec< ScalarT, 3 > grid_;
     grid::Grid2DDataScalar< ScalarT > radii_;
 
-    grid::Grid3DDataScalar< ScalarT > data_u_grid_;
-    grid::Grid3DDataScalar< ScalarT > data_v_grid_;
-
     grid::Grid4DDataScalar< ScalarT > data_T_new_;
     grid::Grid4DDataScalar< ScalarT > data_T_old_;
+
+    const int search_safety_radius = 17;
 
     KOKKOS_INLINE_FUNCTION void
         operator()( const int local_subdomain_id, const int x_cell, const int y_cell, const int r_cell ) const
     {
         auto dof_coords = grid::shell::coords( local_subdomain_id, x_cell, y_cell, r_cell, grid_, radii_ );
 
-        auto rotation_matrix = getRotationMatrix( Vec3{ -1.0, 0.0, 0.0 }, M_PI / 8 ); // To move particles
+        auto rotation_matrix = getRotationMatrix( Vec3{ -1.0, 0.0, 0.0 }, M_PI / 25 ); // To move particles
 
         auto rotated_dof_coords = rotation_matrix * dof_coords;
 
@@ -396,42 +466,23 @@ struct TestCellInterpolator
 
         int i_subdomain = -1;
 
-        for ( int i = 0; i < num_subdomains_; ++i )
+        if ( !subdomain_lookup(
+                 grid_,
+                 num_nodes_per_side_laterally_ - 1,
+                 radii_,
+                 num_nodes_radially_ - 1,
+                 num_subdomains_,
+                 point,
+                 r_point,
+                 i_subdomain ) )
         {
-            dense::Vec< ScalarT, 3 > subdomain_extent[4];
-
-            subdomain_extent[0]( 0 ) = grid_( i, 0, 0, 0 );
-            subdomain_extent[0]( 1 ) = grid_( i, 0, 0, 1 );
-            subdomain_extent[0]( 2 ) = grid_( i, 0, 0, 2 );
-
-            subdomain_extent[1]( 0 ) = grid_( i, num_nodes_per_side_laterally_ - 1, 0, 0 );
-            subdomain_extent[1]( 1 ) = grid_( i, num_nodes_per_side_laterally_ - 1, 0, 1 );
-            subdomain_extent[1]( 2 ) = grid_( i, num_nodes_per_side_laterally_ - 1, 0, 2 );
-
-            subdomain_extent[2]( 0 ) =
-                grid_( i, num_nodes_per_side_laterally_ - 1, num_nodes_per_side_laterally_ - 1, 0 );
-            subdomain_extent[2]( 1 ) =
-                grid_( i, num_nodes_per_side_laterally_ - 1, num_nodes_per_side_laterally_ - 1, 1 );
-            subdomain_extent[2]( 2 ) =
-                grid_( i, num_nodes_per_side_laterally_ - 1, num_nodes_per_side_laterally_ - 1, 2 );
-
-            subdomain_extent[3]( 0 ) = grid_( i, 0, num_nodes_per_side_laterally_ - 1, 0 );
-            subdomain_extent[3]( 1 ) = grid_( i, 0, num_nodes_per_side_laterally_ - 1, 1 );
-            subdomain_extent[3]( 2 ) = grid_( i, 0, num_nodes_per_side_laterally_ - 1, 2 );
-
-            auto subdomain_centroid = sphericalDiamondCentroid( subdomain_extent );
-
-            if ( isPointInSphericalPolygon( subdomain_extent, subdomain_centroid, point ) )
-            {
-                i_subdomain = i;
-                break;
-            }
+            Kokkos::abort( "Subdomain lookup failed" );
         }
 
         // i_subdomain = local_subdomain_id;
 
-        dense::Vec< int, 4 > idx = queryDiamondLookup(
-            grid_, data_u_grid_, data_v_grid_, i_subdomain, point, num_nodes_per_side_laterally_ - 1, 17 );
+        dense::Vec< int, 4 > idx =
+            subdomain_cell_id_lookup( grid_, i_subdomain, point, num_nodes_per_side_laterally_ - 1, search_safety_radius );
 
         int r_i = find_interval( radii_, num_nodes_radially_, i_subdomain, radii_( local_subdomain_id, r_cell ) );
 
@@ -480,40 +531,14 @@ struct TestCellInterpolator
     }
 };
 
-template < typename CoordGridType, typename UVGridType >
-void buildDiamondLookupTable(
-    const CoordGridType& points,
-    UVGridType&          u_grid,
-    UVGridType&          v_grid,
-    int                  N_subdomains,
-    int                  N )
-{
-    for ( int i_sub = 0; i_sub < N_subdomains; ++i_sub )
-    {
-        Vec3 V00{ points( i_sub, 0, 0, 0 ), points( i_sub, 0, 0, 1 ), points( i_sub, 0, 0, 2 ) };
-        Vec3 V01{ points( i_sub, 0, N, 0 ), points( i_sub, 0, N, 1 ), points( i_sub, 0, N, 2 ) };
-        Vec3 V10{ points( i_sub, N, 0, 0 ), points( i_sub, N, 0, 1 ), points( i_sub, N, 0, 2 ) };
-        Vec3 V11{ points( i_sub, N, N, 0 ), points( i_sub, N, N, 1 ), points( i_sub, N, N, 2 ) };
-
-        for ( int i = 0; i <= N; ++i )
-        {
-            for ( int j = 0; j <= N; ++j )
-            {
-                double u{}, v{};
-
-                Vec3 point{ points( i_sub, i, j, 0 ), points( i_sub, i, j, 1 ), points( i_sub, i, j, 2 ) };
-
-                diamondPointToUV( V00, V10, V01, V11, point, u, v );
-                u_grid( i_sub, i, j ) = u;
-                v_grid( i_sub, i, j ) = v;
-            }
-        }
-    }
-}
-
 int main( int argc, char** argv )
 {
     terra::util::terra_initialize( &argc, &argv );
+
+    if ( terra::mpi::num_processes() != 1 )
+    {
+        Kokkos::abort( "This test is designed to run with a single process." );
+    }
 
     using ScalarType = double;
 
@@ -537,24 +562,6 @@ int main( int argc, char** argv )
     auto subdomain_radii_host = Kokkos::create_mirror_view( subdomain_radii );
     Kokkos::deep_copy( subdomain_radii_host, subdomain_radii );
 
-    Grid3DDataScalar< double > subdomain_u(
-        "subdomain_u",
-        domain.subdomains().size(),
-        domain.domain_info().subdomain_num_nodes_per_side_laterally(),
-        domain.domain_info().subdomain_num_nodes_per_side_laterally() );
-
-    Grid3DDataScalar< double > subdomain_v(
-        "subdomain_v",
-        domain.subdomains().size(),
-        domain.domain_info().subdomain_num_nodes_per_side_laterally(),
-        domain.domain_info().subdomain_num_nodes_per_side_laterally() );
-
-    auto subdomain_u_host = Kokkos::create_mirror_view( subdomain_u );
-    // Kokkos::deep_copy( subdomain_u_host, subdomain_u );
-
-    auto subdomain_v_host = Kokkos::create_mirror_view( subdomain_v );
-    // Kokkos::deep_copy( subdomain_v_host, subdomain_v );
-
     VectorQ1Scalar< ScalarType > T( "T", domain, mask_data );
     VectorQ1Scalar< ScalarType > T_new( "T_new", domain, mask_data );
     VectorQ1Scalar< ScalarType > T_mass( "T_mass", domain, mask_data );
@@ -564,8 +571,9 @@ int main( int argc, char** argv )
     // kernels::common::set_constant(k.grid_data(), 1.0);
 
     auto T_new_grid = T_new.grid_data();
-    auto T_grid      = T.grid_data();
-    auto rank_grid   = rank_.grid_data();
+    auto T_grid     = T.grid_data();
+    auto rank_grid  = rank_.grid_data();
+    auto subid_grid = subid.grid_data();
 
     Kokkos::parallel_for(
         "k_interpolate",
@@ -584,11 +592,10 @@ int main( int argc, char** argv )
                 T_grid( local_subdomain_id, x, y, r )     = 0.0;
                 T_new_grid( local_subdomain_id, x, y, r ) = 0.0;
             }
+
+            subid_grid( local_subdomain_id, x, y, r ) = local_subdomain_id;
         } );
     Kokkos::fence();
-
-    int rank;
-    MPI_Comm_rank( MPI_COMM_WORLD, &rank );
 
     int num_subdomains               = domain.subdomains().size();
     int num_nodes_per_side_laterally = domain.domain_info().subdomain_num_nodes_per_side_laterally();
@@ -598,49 +605,49 @@ int main( int argc, char** argv )
     std::cout << "num_nodes_per_side_laterally: " << num_nodes_per_side_laterally << std::endl;
     std::cout << "num_nodes_radially:           " << num_nodes_radially << std::endl;
 
-    // for(int i_rad = 0; i_rad < num_nodes_radially; ++i_rad)
-    // {
-    //     std::cout << "Radial node " << i_rad << ": radius = " << subdomain_radii_host( 0, i_rad ) << std::endl;
-    // }
-
-    buildDiamondLookupTable(
-        subdomain_coords_host, subdomain_u_host, subdomain_v_host, num_subdomains, num_nodes_per_side_laterally - 1 );
-
-    Kokkos::deep_copy( subdomain_u, subdomain_u_host );
-    Kokkos::deep_copy( subdomain_v, subdomain_v_host );
-
     io::XDMFOutput< ScalarType > xdmf_output( "./output/", domain, subdomain_shell_coords, subdomain_radii );
 
     xdmf_output.add( T_grid );
     xdmf_output.add( T_new_grid );
+    xdmf_output.add( subid_grid );
 
     xdmf_output.write( 0 );
 
-    // const int n_timesteps = 8;
+    const int n_timesteps = 51;
 
-    // for(int i_timestep = 0; i_timestep < n_timesteps; ++i_timestep)
-    // {
+    Kokkos::Timer timer;
 
-    Kokkos::parallel_for(
-        "test_idx_lookup",
-        grid::shell::local_domain_md_range_policy_nodes( domain ),
-        TestCellInterpolator(
-            num_subdomains,
-            num_nodes_radially,
-            num_nodes_per_side_laterally,
-            subdomain_shell_coords,
-            subdomain_radii,
-            subdomain_u,
-            subdomain_v,
-            T_new_grid,
-            T_grid ) );
-    Kokkos::fence();
+    for ( int i_timestep = 0; i_timestep < n_timesteps; ++i_timestep )
+    {
+        std::cout << "Running step " << i_timestep + 1 << std::endl;
 
-    // kernels::common::lincomb( T_old_grid, 0.0, 1.0, T_grid );
+        timer.reset();
 
-    xdmf_output.write( 1 );
+        Kokkos::parallel_for(
+            "test_idx_lookup",
+            grid::shell::local_domain_md_range_policy_nodes( domain ),
+            TestParticleSteppingKernel(
+                num_subdomains,
+                num_nodes_radially,
+                num_nodes_per_side_laterally,
+                subdomain_shell_coords,
+                subdomain_radii,
+                T_new_grid,
+                T_grid ) );
+        Kokkos::fence();
 
-    // }
+        const auto time_solver = timer.seconds();
+        std::cout << "Time taken for step: " << time_solver << std::endl;
+
+        std::cout << "Completed step " << i_timestep + 1 << std::endl << std::endl;
+
+        if ( i_timestep % 10 == 0 )
+        {
+            xdmf_output.write( i_timestep );
+        }
+
+        kernels::common::lincomb( T_grid, 0.0, 1.0, T_new_grid );
+    }
 
     return 0;
 }
