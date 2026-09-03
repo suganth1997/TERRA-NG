@@ -114,6 +114,7 @@ add_terra_test(test_ev_advection_diffusion)
 add_terra_test(test_shear_heating)
 
 add_terra_test(test_stuff)
+add_terra_test(test_stuff_gpu)
 
 # Adding target for all the tests.
 get_property(ALL_TERRA_TESTS GLOBAL PROPERTY TERRA_TEST_TARGETS)

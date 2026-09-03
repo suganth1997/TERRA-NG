@@ -256,25 +256,31 @@ struct TestCellInterpolator
 template < typename CoordGridType, typename UVGridType >
 void buildDiamondLookupTable(
     const CoordGridType& points,
-    const Vec3&          V00,
-    const Vec3&          V10,
-    const Vec3&          V01,
-    const Vec3&          V11,
     UVGridType&          u_grid,
     UVGridType&          v_grid,
+    int                  N_subdomain,
     int                  N )
 {
-    for ( int i = 0; i <= N; ++i )
+    for ( int i_subdomain = 0; i_subdomain < N_subdomain; i_subdomain++ )
     {
-        for ( int j = 0; j <= N; ++j )
+        Vec3 V00{ points( i_subdomain, 0, 0, 0 ), points( i_subdomain, 0, 0, 1 ), points( i_subdomain, 0, 0, 2 ) };
+        Vec3 V01{ points( i_subdomain, 0, N, 0 ), points( i_subdomain, 0, N, 1 ), points( i_subdomain, 0, N, 2 ) };
+        Vec3 V10{ points( i_subdomain, N, 0, 0 ), points( i_subdomain, N, 0, 1 ), points( i_subdomain, N, 0, 2 ) };
+        Vec3 V11{ points( i_subdomain, N, N, 0 ), points( i_subdomain, N, N, 1 ), points( i_subdomain, N, N, 2 ) };
+
+        for ( int i = 0; i <= N; ++i )
         {
-            double u{}, v{};
+            for ( int j = 0; j <= N; ++j )
+            {
+                double u{}, v{};
 
-            Vec3 point{ points( 0, i, j, 0 ), points( 0, i, j, 1 ), points( 0, i, j, 2 ) };
+                Vec3 point{
+                    points( i_subdomain, i, j, 0 ), points( i_subdomain, i, j, 1 ), points( i_subdomain, i, j, 2 ) };
 
-            diamondPointToUV( V00, V10, V01, V11, point, u, v );
-            u_grid( 0, i, j ) = u;
-            v_grid( 0, i, j ) = v;
+                diamondPointToUV( V00, V10, V01, V11, point, u, v );
+                u_grid( i_subdomain, i, j ) = u;
+                v_grid( i_subdomain, i, j ) = v;
+            }
         }
     }
 }
@@ -293,14 +299,20 @@ std::tuple< int, int, int, int > queryDiamondLookup(
     const CoordsGridType& coords_host,
     const UVGridType&     u_grid,
     const UVGridType&     v_grid,
-    const Vec3&           V00,
-    const Vec3&           V10,
-    const Vec3&           V01,
-    const Vec3&           V11,
+    const int             i_subdomain,
     const Vec3            P,
     int                   N,
     int                   refine_radius = 2 )
 {
+    Vec3 V00{
+        coords_host( i_subdomain, 0, 0, 0 ), coords_host( i_subdomain, 0, 0, 1 ), coords_host( i_subdomain, 0, 0, 2 ) };
+    Vec3 V01{
+        coords_host( i_subdomain, 0, N, 0 ), coords_host( i_subdomain, 0, N, 1 ), coords_host( i_subdomain, 0, N, 2 ) };
+    Vec3 V10{
+        coords_host( i_subdomain, N, 0, 0 ), coords_host( i_subdomain, N, 0, 1 ), coords_host( i_subdomain, N, 0, 2 ) };
+    Vec3 V11{
+        coords_host( i_subdomain, N, N, 0 ), coords_host( i_subdomain, N, N, 1 ), coords_host( i_subdomain, N, N, 2 ) };
+
     double u{}, v{};
     bool   conversion = diamondPointToUV( V00, V10, V01, V11, P, u, v );
 
@@ -352,18 +364,18 @@ std::tuple< int, int, int, int > queryDiamondLookup(
                 if ( i < 0 || i > N - 1 || j < 0 || j > N - 1 )
                     continue;
 
-                Vec3 point00{ coords_host( 0, i, j, 0 ), coords_host( 0, i, j, 1 ), coords_host( 0, i, j, 2 ) };
+                Vec3 point00{ coords_host( i_subdomain, i, j, 0 ), coords_host( i_subdomain, i, j, 1 ), coords_host( i_subdomain, i, j, 2 ) };
 
                 Vec3 point10{
-                    coords_host( 0, i + 1, j, 0 ), coords_host( 0, i + 1, j, 1 ), coords_host( 0, i + 1, j, 2 ) };
+                    coords_host( i_subdomain, i + 1, j, 0 ), coords_host( i_subdomain, i + 1, j, 1 ), coords_host( i_subdomain, i + 1, j, 2 ) };
 
                 Vec3 point01{
-                    coords_host( 0, i, j + 1, 0 ), coords_host( 0, i, j + 1, 1 ), coords_host( 0, i, j + 1, 2 ) };
+                    coords_host( i_subdomain, i, j + 1, 0 ), coords_host( i_subdomain, i, j + 1, 1 ), coords_host( i_subdomain, i, j + 1, 2 ) };
 
                 Vec3 point11{
-                    coords_host( 0, i + 1, j + 1, 0 ),
-                    coords_host( 0, i + 1, j + 1, 1 ),
-                    coords_host( 0, i + 1, j + 1, 2 ) };
+                    coords_host( i_subdomain, i + 1, j + 1, 0 ),
+                    coords_host( i_subdomain, i + 1, j + 1, 1 ),
+                    coords_host( i_subdomain, i + 1, j + 1, 2 ) };
 
                 Vec3 points[4] = { point00, point10, point11, point01 };
 
@@ -390,7 +402,7 @@ int main( int argc, char** argv )
 
     using ScalarType = double;
 
-    const int level = 8;
+    const int level = 6;
 
     const auto domain = DistributedDomain::create_uniform( level, level, 0.5, 1.0, 0, 0 );
 
@@ -439,151 +451,73 @@ int main( int argc, char** argv )
 
     int num_nodes_per_side_laterally = domain.domain_info().subdomain_num_nodes_per_side_laterally();
 
-    std::cout << std::endl;
-    std::cout << std::endl;
-    std::cout << "subdomain_coords_host(1, 0, 0, 0): " << subdomain_coords_host( 1, 0, 0, 0 ) << std::endl;
-    std::cout << "subdomain_coords_host(1, 0, 0, 1): " << subdomain_coords_host( 1, 0, 0, 1 ) << std::endl;
-    std::cout << "subdomain_coords_host(1, 0, 0, 2): " << subdomain_coords_host( 1, 0, 0, 2 ) << std::endl;
-    std::cout << std::endl;
-    std::cout << std::endl;
-    std::cout << "subdomain_coords_host(1, n, 0, 0): "
-              << subdomain_coords_host( 1, num_nodes_per_side_laterally - 1, 0, 0 ) << std::endl;
-    std::cout << "subdomain_coords_host(1, n, 0, 1): "
-              << subdomain_coords_host( 1, num_nodes_per_side_laterally - 1, 0, 1 ) << std::endl;
-    std::cout << "subdomain_coords_host(1, n, 0, 2): "
-              << subdomain_coords_host( 1, num_nodes_per_side_laterally - 1, 0, 2 ) << std::endl;
-    std::cout << std::endl;
-    std::cout << std::endl;
-    std::cout << "subdomain_coords_host(1, n, n, 0): "
-              << subdomain_coords_host( 1, num_nodes_per_side_laterally - 1, num_nodes_per_side_laterally - 1, 0 )
-              << std::endl;
-    std::cout << "subdomain_coords_host(1, n, n, 1): "
-              << subdomain_coords_host( 1, num_nodes_per_side_laterally - 1, num_nodes_per_side_laterally - 1, 1 )
-              << std::endl;
-    std::cout << "subdomain_coords_host(1, n, n, 2): "
-              << subdomain_coords_host( 1, num_nodes_per_side_laterally - 1, num_nodes_per_side_laterally - 1, 2 )
-              << std::endl;
-    std::cout << std::endl;
-    std::cout << "subdomain_coords_host(1, 0, n, 0): "
-              << subdomain_coords_host( 1, 0, num_nodes_per_side_laterally - 1, 0 ) << std::endl;
-    std::cout << "subdomain_coords_host(1, 0, n, 1): "
-              << subdomain_coords_host( 1, 0, num_nodes_per_side_laterally - 1, 1 ) << std::endl;
-    std::cout << "subdomain_coords_host(1, 0, n, 2): "
-              << subdomain_coords_host( 1, 0, num_nodes_per_side_laterally - 1, 2 ) << std::endl;
-    std::cout << std::endl;
-    std::cout << std::endl;
-
     std::cout << "num_nodes_per_side_laterally: " << num_nodes_per_side_laterally << std::endl;
 
-    Vec3 V00{
-        subdomain_coords_host( 0, 0, 0, 0 ), subdomain_coords_host( 0, 0, 0, 1 ), subdomain_coords_host( 0, 0, 0, 2 ) };
-    Vec3 V01{
-        subdomain_coords_host( 0, 0, num_nodes_per_side_laterally - 1, 0 ),
-        subdomain_coords_host( 0, 0, num_nodes_per_side_laterally - 1, 1 ),
-        subdomain_coords_host( 0, 0, num_nodes_per_side_laterally - 1, 2 ) };
-    Vec3 V10{
-        subdomain_coords_host( 0, num_nodes_per_side_laterally - 1, 0, 0 ),
-        subdomain_coords_host( 0, num_nodes_per_side_laterally - 1, 0, 1 ),
-        subdomain_coords_host( 0, num_nodes_per_side_laterally - 1, 0, 2 ) };
-    Vec3 V11{
-        subdomain_coords_host( 0, num_nodes_per_side_laterally - 1, num_nodes_per_side_laterally - 1, 0 ),
-        subdomain_coords_host( 0, num_nodes_per_side_laterally - 1, num_nodes_per_side_laterally - 1, 1 ),
-        subdomain_coords_host( 0, num_nodes_per_side_laterally - 1, num_nodes_per_side_laterally - 1, 2 ) };
-
     buildDiamondLookupTable(
-        subdomain_coords_host,
-        V00,
-        V10,
-        V01,
-        V11,
-        subdomain_u_host,
-        subdomain_v_host,
-        num_nodes_per_side_laterally - 1 );
-
-    // for ( int i = 0; i < num_nodes_per_side_laterally; ++i )
-    // {
-    //     for ( int j = 0; j < num_nodes_per_side_laterally; ++j )
-    //     {
-    //         auto [u_i, v_i] = queryDiamondLookup(
-    //             subdomain_u_host,
-    //             subdomain_v_host,
-    //             V00,
-    //             V10,
-    //             V01,
-    //             V11,
-    //             Vec3{
-    //                 subdomain_coords_host( 0, i, j, 0 ),
-    //                 subdomain_coords_host( 0, i, j, 1 ),
-    //                 subdomain_coords_host( 0, i, j, 2 )
-    //             },
-    //             num_nodes_per_side_laterally - 1, 5 );
-
-    //         if( i != u_i || j != v_i )
-    //         {
-    //             std::cout << "Query result for (" << i << ", " << j << "): u_i = " << u_i << ", v_i = " << v_i << std::endl;
-    //         }
-    //     }
-    //     // std::cout << std::endl;
-    // }
+        subdomain_coords_host, subdomain_u_host, subdomain_v_host, num_subdomains, num_nodes_per_side_laterally - 1 );
 
     std::random_device                       rd;
     std::mt19937                             gen( rd() );
     std::uniform_int_distribution< int >     distrib( 0, num_nodes_per_side_laterally - 2 );
+    std::uniform_int_distribution< int >     distrib_sub( 0, num_subdomains - 1 );
     std::uniform_real_distribution< double > distrib_real( 0, 1 );
-
-    // int query_i = distrib( gen );
-    // // int query_i = num_nodes_per_side_laterally - 1;
-
-    // int query_j = distrib( gen );
-    // // int query_j = num_nodes_per_side_laterally - 1;
 
     int n_tests = 100;
 
     std::cout << "Test started!" << std::endl;
 
-    while(n_tests--)
+    while ( n_tests-- )
     {
+        int i_subdomain = distrib_sub( gen );
+
         int query_i = distrib( gen );
         int query_j = distrib( gen );
 
         Vec3 query_boundary_xx = {
-            subdomain_coords_host( 0, query_i, query_j, 0 ),
-            subdomain_coords_host( 0, query_i, query_j, 1 ),
-            subdomain_coords_host( 0, query_i, query_j, 2 ) };
+            subdomain_coords_host( i_subdomain, query_i, query_j, 0 ),
+            subdomain_coords_host( i_subdomain, query_i, query_j, 1 ),
+            subdomain_coords_host( i_subdomain, query_i, query_j, 2 ) };
 
         Vec3 query_boundary_xy = {
-            subdomain_coords_host( 0, query_i, query_j + 1, 0 ),
-            subdomain_coords_host( 0, query_i, query_j + 1, 1 ),
-            subdomain_coords_host( 0, query_i, query_j + 1, 2 ) };
+            subdomain_coords_host( i_subdomain, query_i, query_j + 1, 0 ),
+            subdomain_coords_host( i_subdomain, query_i, query_j + 1, 1 ),
+            subdomain_coords_host( i_subdomain, query_i, query_j + 1, 2 ) };
 
         Vec3 query_boundary_yx = {
-            subdomain_coords_host( 0, query_i + 1, query_j, 0 ),
-            subdomain_coords_host( 0, query_i + 1, query_j, 1 ),
-            subdomain_coords_host( 0, query_i + 1, query_j, 2 ) };
+            subdomain_coords_host( i_subdomain, query_i + 1, query_j, 0 ),
+            subdomain_coords_host( i_subdomain, query_i + 1, query_j, 1 ),
+            subdomain_coords_host( i_subdomain, query_i + 1, query_j, 2 ) };
 
         Vec3 query_boundary_yy = {
-            subdomain_coords_host( 0, query_i + 1, query_j + 1, 0 ),
-            subdomain_coords_host( 0, query_i + 1, query_j + 1, 1 ),
-            subdomain_coords_host( 0, query_i + 1, query_j + 1, 2 ) };
+            subdomain_coords_host( i_subdomain, query_i + 1, query_j + 1, 0 ),
+            subdomain_coords_host( i_subdomain, query_i + 1, query_j + 1, 1 ),
+            subdomain_coords_host( i_subdomain, query_i + 1, query_j + 1, 2 ) };
 
         double rand_u = distrib_real( gen );
         double rand_v = distrib_real( gen );
 
         Vec3 query_point = ( 1.0 - rand_u ) * ( 1.0 - rand_v ) * query_boundary_xx +
-                        rand_u * ( 1.0 - rand_v ) * query_boundary_yx + ( 1.0 - rand_u ) * rand_v * query_boundary_xy +
-                        rand_u * rand_v * query_boundary_yy;
+                           rand_u * ( 1.0 - rand_v ) * query_boundary_yx +
+                           ( 1.0 - rand_u ) * rand_v * query_boundary_xy + rand_u * rand_v * query_boundary_yy;
 
         query_point.normalize();
 
         auto [u_i, u_i_plus_1, v_i, v_i_plus_1] = queryDiamondLookup(
-            subdomain_coords_host, subdomain_u_host, subdomain_v_host, V00, V10, V01, V11, query_point, num_nodes_per_side_laterally - 1, 21 );
+            subdomain_coords_host,
+            subdomain_u_host,
+            subdomain_v_host,
+            i_subdomain,
+            query_point,
+            num_nodes_per_side_laterally - 1,
+            21 );
 
-        if( u_i != query_i || v_i != query_j)
+        if ( u_i != query_i || v_i != query_j )
         {
             std::cout << "rand_u: " << rand_u << ", rand_v: " << rand_v << std::endl << std::endl;
 
             std::cout << "Query result for (" << query_i << ", " << query_j << "): u_i = " << u_i
-                    << ", u_i_plus_1 = " << u_i_plus_1 << ", v_i = " << v_i << ", v_i_plus_1 = " << v_i_plus_1 << std::endl;
+                      << ", u_i_plus_1 = " << u_i_plus_1 << ", v_i = " << v_i << ", v_i_plus_1 = " << v_i_plus_1
+                      << std::endl;
         }
     }
 
