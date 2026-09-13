@@ -37,9 +37,11 @@
 ///       substep spanned the whole timestep and silently drop the temporal order back to first order.
 ///
 /// The scheme is unconditionally stable in the advective sense: there is no CFL restriction from the
-/// characteristic tracing itself. The *implementation* is bounded by the ghost layer width, since a foot point
-/// must remain inside the local subdomain plus its ghost layer. \ref MMOCTransport::recommended_substeps
-/// converts a Courant number into the number of substeps that keeps every substep inside that budget.
+/// characteristic tracing itself. The *implementation* is bounded by the ghost layer width, but only at seams
+/// with subdomains held by another rank: a foot point is searched for in every subdomain of this rank, and only
+/// one that lands in a remote subdomain has to stay within its own subdomain's ghost layer.
+/// \ref MMOCTransport::recommended_substeps converts a Courant number into the number of substeps that keeps
+/// every substep inside that budget.
 ///
 /// **Interpolation.** The field at the foot point is evaluated with
 /// \ref terra::fe::wedge::sl::evaluate_cubic_scalar, which reconstructs it over the structured index stencil
@@ -210,6 +212,9 @@ class MMOCTransport
     /// subdomain plus its ghost layer, because that is all the data available to interpolate from. Substepping
     /// does **not** relax this: substeps refine the trajectory but the foot point still ends up a full Courant
     /// number away. Raising the limit means widening \ref terra::fe::wedge::sl::ghost_width.
+    ///
+    /// The limit only binds at a seam with a subdomain held by *another* rank. A departure point that crosses
+    /// into a subdomain of the same rank is located there directly, whatever the distance.
     [[nodiscard]] static constexpr ScalarType max_courant()
     {
         // A margin below the ghost width, so that the foot point stays strictly inside the ghosted region.
@@ -308,9 +313,9 @@ class MMOCTransport
 
     /// @brief Number of nodes whose departure point could not be located in the last \ref step.
     ///
-    /// Those nodes keep their previous value (no advection). A non-zero count means the per-substep Courant
-    /// number exceeded the ghost layer width, or that the departure point fell into one of the degenerate
-    /// corner regions at the twelve pentagonal points of the icosahedral grid.
+    /// Those nodes are interpolated at the closest point of the last wedge the trace accepted. A departure
+    /// point is searched for in every subdomain of this rank, so a non-zero count means it ended up in a
+    /// subdomain held by another rank, further out than the ghost layer reaches.
     [[nodiscard]] long long last_escapes() const { return last_escapes_; }
 
     /// @internal Traces the characteristics and writes the result into `T_new_`.
@@ -352,6 +357,15 @@ class MMOCTransport
         constexpr int    max_walk = 4 * sl::ghost_width + 4;
         constexpr auto   eps      = ScalarType( 1e-12 );
 
+        // Fallback search over the subdomains of this rank, for a point the walk could not find. The budgets
+        // are those of the direct-location tests.
+        const int                   num_sd                 = exchange_.num_subdomains();
+        const sl::LateralCornerBox  owned_box              = { sl::ghost_width, sl::ghost_width,
+                                                               sl::ghost_width + n_lat_owned - 1,
+                                                               sl::ghost_width + n_lat_owned - 1 };
+        constexpr int               direct_max_refinements = 2;
+        constexpr int               direct_max_walk        = 4;
+
         const auto T_old         = T.grid_data();
         const auto lateral_valid = lateral_valid_;
         const auto escape_loc     = escape_locations_;
@@ -378,17 +392,19 @@ class MMOCTransport
                 // surface exist only so that the radii array stays monotone; they hold extrapolated radii and
                 // no field data at all, so trim them off too. In both directions the window then slides
                 // inwards near the edge (one-sided but never extrapolating), and a foot point that lands
-                // outside the range altogether falls back to the Q1 evaluation.
-                sl::StencilBounds stencil{ { sl::ghost_width, n_lat_g - 1 - sl::ghost_width },
-                                           { sl::ghost_width, n_lat_g - 1 - sl::ghost_width },
-                                           { 0, n_rad_g - 1 } };
-                {
+                // outside the range altogether falls back to the Q1 evaluation. The radial trim depends on the
+                // subdomain's radii, so it is taken for the subdomain the foot point was located in.
+                const auto stencil_for = [&]( const int s ) {
+                    sl::StencilBounds stencil{ { sl::ghost_width, n_lat_g - 1 - sl::ghost_width },
+                                               { sl::ghost_width, n_lat_g - 1 - sl::ghost_width },
+                                               { 0, n_rad_g - 1 } };
                     const ScalarType r_tol = ScalarType( 1e-12 ) * r_max;
-                    while ( stencil.r.lo < stencil.r.hi && radii_g( sd, stencil.r.lo ) < r_min - r_tol )
+                    while ( stencil.r.lo < stencil.r.hi && radii_g( s, stencil.r.lo ) < r_min - r_tol )
                         ++stencil.r.lo;
-                    while ( stencil.r.hi > stencil.r.lo && radii_g( sd, stencil.r.hi ) > r_max + r_tol )
+                    while ( stencil.r.hi > stencil.r.lo && radii_g( s, stencil.r.hi ) > r_max + r_tol )
                         --stencil.r.hi;
-                }
+                    return stencil;
+                };
 
                 // Seed with a cell all of whose nodes are owned: it always contains this node as a vertex,
                 // and it can never be one of the degenerate ghost-corner wedges.
@@ -396,6 +412,38 @@ class MMOCTransport
                                     sl::to_ghosted_index( Kokkos::min( y, n_lat_owned - 2 ) ),
                                     sl::to_ghosted_index( Kokkos::min( r, n_rad_owned - 2 ) ),
                                     0 };
+
+                // The subdomain `cell` refers to. The trajectory may cross into another subdomain of this rank,
+                // and then continues there; the result is still written to this node.
+                int cur_sd = sd;
+
+                // Walks from `cell`; if that fails -- the point left the ghosted region, or the walk ran out of
+                // steps or into a degenerate corner -- offers the point to every subdomain of this rank. On
+                // success `cell` and `cur_sd` follow the point; on failure both keep the last accepted wedge.
+                const auto locate = [&]( const Vec3& Y ) {
+                    auto res = sl::locate_point(
+                        Y, cur_sd, cell, lateral, radii_g, bounds, max_walk, eps,
+                        /*clamp_radially=*/true, r_min, r_max, lateral_valid );
+
+                    if ( !res.found )
+                    {
+                        int        other     = -1;
+                        const auto res_other = sl::locate_point_in_local_subdomains(
+                            Y, cur_sd, num_sd, lateral, radii_g, owned_box, bounds, direct_max_refinements,
+                            direct_max_walk, eps, /*clamp_radially=*/true, r_min, r_max, lateral_valid, other );
+
+                        if ( res_other.found )
+                        {
+                            res    = res_other;
+                            cur_sd = other;
+                        }
+                    }
+
+                    if ( res.found )
+                        cell = res.cell;
+
+                    return res;
+                };
 
                 bool escaped = false;
 
@@ -410,25 +458,22 @@ class MMOCTransport
                         for ( int l = 0; l < s; ++l )
                             Y = Y + kv[l] * ( h * tableau.A[s][l] );
 
-                        const auto res = sl::locate_point(
-                            Y, sd, cell, lateral, radii_g, bounds, max_walk, eps,
-                            /*clamp_radially=*/true, r_min, r_max, lateral_valid );
+                        const auto res = locate( Y );
 
                         if ( !res.found )
                         {
                             escaped = true;
                             break;
                         }
-                        cell = res.cell;
 
                         // Q1 for the velocity. An error here displaces the foot point and enters T just as
                         // directly as an error in T itself, but the cubic reconstruction buys nothing on this
                         // grid: a Stokes velocity is smooth, and in the rotation test the two are
                         // indistinguishable while Q1 is an order of magnitude cheaper.
-                        const auto u_new_s =
-                            sl::evaluate_q1_vec< ScalarType, 3 >( u_g, sd, res.cell, res.xi, res.eta, res.zeta );
+                        const auto u_new_s = sl::evaluate_q1_vec< ScalarType, 3 >(
+                            u_g, cur_sd, res.cell, res.xi, res.eta, res.zeta );
                         const auto u_old_s = sl::evaluate_q1_vec< ScalarType, 3 >(
-                            u_old_g, sd, res.cell, res.xi, res.eta, res.zeta );
+                            u_old_g, cur_sd, res.cell, res.xi, res.eta, res.zeta );
 
                         // Global pseudo-time of this stage, in [0, 1] across the whole timestep.
                         const ScalarType tau = ( static_cast< ScalarType >( m ) + tableau.c[s] ) * inv_M;
@@ -448,9 +493,7 @@ class MMOCTransport
 
                 if ( !escaped )
                 {
-                    const auto res = sl::locate_point(
-                        X, sd, cell, lateral, radii_g, bounds, max_walk, eps,
-                        /*clamp_radially=*/true, r_min, r_max, lateral_valid );
+                    const auto res = locate( X );
 
                     if ( res.found )
                     {
@@ -459,31 +502,33 @@ class MMOCTransport
                         // marches a radially stratified field inwards.
                         sl::WedgeCell ev_cell = res.cell;
                         ScalarType    ev_zeta = res.zeta;
-                        sl::radial_coords_from_radius( sd, X.norm(), radii_g, n_rad_g - 1, r_min, r_max,
+                        sl::radial_coords_from_radius( cur_sd, X.norm(), radii_g, n_rad_g - 1, r_min, r_max,
                                                        ev_cell.r, ev_zeta );
 
                         const ScalarType value = sl::evaluate_cubic_scalar(
-                            T_g, sd, ev_cell, res.xi, res.eta, ev_zeta, radii_g, stencil, lateral_valid,
+                            T_g, cur_sd, ev_cell, res.xi, res.eta, ev_zeta, radii_g, stencil_for( cur_sd ),
+                            lateral_valid,
                             /*clip_to_cell=*/true, /*limit_slopes=*/false, interp_width );
                         T_new( sd, x, y, r ) = Kokkos::clamp( value, t_min, t_max );
                         return;
                     }
                 }
 
-                // The departure point left the ghosted region, or the walk ran into one of the degenerate
-                // corner wedges. `cell` still holds the last wedge that was accepted, so interpolate at the
-                // point of that wedge closest to the departure point: a bounded, first-order error, rather
-                // than leaving the node un-advected for a whole timestep.
+                // No subdomain of this rank contains the departure point: it lies in a subdomain held by another
+                // rank, further out than the ghost layer reaches. `cell` still holds the last wedge that was
+                // accepted (in `cur_sd`), so interpolate at the point of that wedge closest to the departure
+                // point: a bounded, first-order error, rather than leaving the node un-advected for a whole
+                // timestep.
                 {
                     ScalarType xi = 0, eta = 0, zeta = 0;
-                    sl::clamp_to_wedge( X, sd, cell, lateral, radii_g, xi, eta, zeta );
+                    sl::clamp_to_wedge( X, cur_sd, cell, lateral, radii_g, xi, eta, zeta );
 
                     sl::WedgeCell ev_cell = cell;
-                    sl::radial_coords_from_radius( sd, X.norm(), radii_g, n_rad_g - 1, r_min, r_max,
+                    sl::radial_coords_from_radius( cur_sd, X.norm(), radii_g, n_rad_g - 1, r_min, r_max,
                                                    ev_cell.r, zeta );
 
                     const ScalarType value = sl::evaluate_cubic_scalar(
-                        T_g, sd, ev_cell, xi, eta, zeta, radii_g, stencil, lateral_valid,
+                        T_g, cur_sd, ev_cell, xi, eta, zeta, radii_g, stencil_for( cur_sd ), lateral_valid,
                         /*clip_to_cell=*/true, /*limit_slopes=*/false, interp_width );
                     T_new( sd, x, y, r )   = Kokkos::clamp( value, t_min, t_max );
                 }

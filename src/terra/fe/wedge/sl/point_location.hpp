@@ -749,6 +749,67 @@ KOKKOS_INLINE_FUNCTION LocateResult< T > locate_point_direct(
         rho_clamp_min, rho_clamp_max, lateral_valid );
 }
 
+/// @brief Locates a physical point in whichever subdomain of this rank contains it.
+///
+/// The fallback for a point \ref locate_point could not find from its seed. The walk is confined to one
+/// subdomain's index space, and a neighbouring diamond has its own, differently oriented, indexing, so the walk
+/// cannot carry on across a seam. Instead every local subdomain is offered the point, starting with
+/// `preferred_subdomain` (the walk may merely have run out of steps there).
+///
+/// \ref predict_lateral_cell against the owned corner box is the ownership test: the grid's edge nodes lie on
+/// the great circles between the diamond corners, so the diamond is exactly the two spherical triangles the
+/// predictor checks. Only a subdomain that passes it pays for \ref locate_point_direct.
+///
+/// The point must also lie in the subdomain radially. \ref locate_point clamps the cone radius onto the
+/// physical shell, not onto the subdomain's radial extent, so with radially split subdomains a point above or
+/// below one comes back as found with `zeta` outside `[-1, 1]`; such a result is rejected.
+///
+/// `box` and `bounds` are those of a single subdomain, which all subdomains share. On success `subdomain` is
+/// the subdomain the result refers to; otherwise it is -1 and `found` is false. A point on a seam between two
+/// local subdomains is claimed by both, and either answer is valid.
+template < typename T, typename CoordsShellType, typename CoordsRadiiType, typename LateralValidityType >
+KOKKOS_INLINE_FUNCTION LocateResult< T > locate_point_in_local_subdomains(
+    const dense::Vec< T, 3 >&  X,
+    const int                  preferred_subdomain,
+    const int                  num_subdomains,
+    const CoordsShellType&     coords_shell,
+    const CoordsRadiiType&     coords_radii,
+    const LateralCornerBox&    box,
+    const IndexBounds&         bounds,
+    const int                  max_refinements,
+    const int                  max_walk_steps,
+    const T                    eps,
+    const bool                 clamp_radially,
+    const T                    rho_clamp_min,
+    const T                    rho_clamp_max,
+    const LateralValidityType& lateral_valid,
+    int&                       subdomain )
+{
+    constexpr T zeta_tol = T( 1e-10 );
+
+    subdomain = -1;
+
+    for ( int k = 0; k < num_subdomains; ++k )
+    {
+        const int s = ( preferred_subdomain + k ) % num_subdomains;
+
+        if ( predict_lateral_cell( X, s, coords_shell, box, bounds, eps ).outside_quad )
+            continue;
+
+        const auto res = locate_point_direct(
+            X, s, coords_shell, coords_radii, box, bounds, max_refinements, max_walk_steps, eps, clamp_radially,
+            rho_clamp_min, rho_clamp_max, lateral_valid );
+
+        if ( !res.found || res.zeta < -T( 1 ) - zeta_tol || res.zeta > T( 1 ) + zeta_tol )
+            continue;
+
+        subdomain = s;
+        return res;
+    }
+
+    return LocateResult< T >{};
+}
+
 /// @brief Evaluates a Q1 scalar wedge field at reference coordinates inside a wedge cell.
 template < typename T, typename FieldViewType >
 KOKKOS_INLINE_FUNCTION T evaluate_q1_scalar(
