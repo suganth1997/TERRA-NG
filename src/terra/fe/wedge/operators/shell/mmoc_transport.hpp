@@ -314,8 +314,9 @@ class MMOCTransport
     /// @brief Number of nodes whose departure point could not be located in the last \ref step.
     ///
     /// Those nodes are interpolated at the closest point of the last wedge the trace accepted. A departure
-    /// point is searched for in every subdomain of this rank, so a non-zero count means it ended up in a
-    /// subdomain held by another rank, further out than the ghost layer reaches.
+    /// point is searched for in every subdomain of this rank and in the starting subdomain's ghost layer, so a
+    /// non-zero count means it ended up in a subdomain held by another rank, further out than the ghost layer
+    /// reaches, or in a wedge touching one of the degenerate corners at the twelve pentagonal points.
     [[nodiscard]] long long last_escapes() const { return last_escapes_; }
 
     /// @internal Traces the characteristics and writes the result into `T_new_`.
@@ -408,18 +409,27 @@ class MMOCTransport
 
                 // Seed with a cell all of whose nodes are owned: it always contains this node as a vertex,
                 // and it can never be one of the degenerate ghost-corner wedges.
-                sl::WedgeCell cell{ sl::to_ghosted_index( Kokkos::min( x, n_lat_owned - 2 ) ),
-                                    sl::to_ghosted_index( Kokkos::min( y, n_lat_owned - 2 ) ),
-                                    sl::to_ghosted_index( Kokkos::min( r, n_rad_owned - 2 ) ),
-                                    0 };
+                const sl::WedgeCell seed{ sl::to_ghosted_index( Kokkos::min( x, n_lat_owned - 2 ) ),
+                                          sl::to_ghosted_index( Kokkos::min( y, n_lat_owned - 2 ) ),
+                                          sl::to_ghosted_index( Kokkos::min( r, n_rad_owned - 2 ) ),
+                                          0 };
+                sl::WedgeCell       cell = seed;
 
                 // The subdomain `cell` refers to. The trajectory may cross into another subdomain of this rank,
                 // and then continues there; the result is still written to this node.
                 int cur_sd = sd;
 
-                // Walks from `cell`; if that fails -- the point left the ghosted region, or the walk ran out of
-                // steps or into a degenerate corner -- offers the point to every subdomain of this rank. On
-                // success `cell` and `cur_sd` follow the point; on failure both keep the last accepted wedge.
+                // Finds Y, in this order:
+                //
+                //   1. Walk from `cell` in `cur_sd`, which reaches that subdomain's ghost layer.
+                //   2. Every subdomain of this rank, owned region only. An owned hit is preferred over a ghost
+                //      one, since the cubic stencil is confined to the owned block.
+                //   3. Walk from the original seed in the starting subdomain `sd`, if the trajectory has left it.
+                //      That reaches `sd`'s ghost layer, and so a remote subdomain across its seam. Within the
+                //      Courant limit every point of the trajectory lies in that ghosted region, so this is also
+                //      exactly the lookup the trace did before it could switch subdomains.
+                //
+                // On success `cell` and `cur_sd` follow the point; on failure both keep the last accepted wedge.
                 const auto locate = [&]( const Vec3& Y ) {
                     auto res = sl::locate_point(
                         Y, cur_sd, cell, lateral, radii_g, bounds, max_walk, eps,
@@ -436,6 +446,19 @@ class MMOCTransport
                         {
                             res    = res_other;
                             cur_sd = other;
+                        }
+                    }
+
+                    if ( !res.found && cur_sd != sd )
+                    {
+                        const auto res_start = sl::locate_point(
+                            Y, sd, seed, lateral, radii_g, bounds, max_walk, eps,
+                            /*clamp_radially=*/true, r_min, r_max, lateral_valid );
+
+                        if ( res_start.found )
+                        {
+                            res    = res_start;
+                            cur_sd = sd;
                         }
                     }
 
@@ -514,11 +537,12 @@ class MMOCTransport
                     }
                 }
 
-                // No subdomain of this rank contains the departure point: it lies in a subdomain held by another
-                // rank, further out than the ghost layer reaches. `cell` still holds the last wedge that was
-                // accepted (in `cur_sd`), so interpolate at the point of that wedge closest to the departure
-                // point: a bounded, first-order error, rather than leaving the node un-advected for a whole
-                // timestep.
+                // No subdomain of this rank contains the departure point, and neither does the starting
+                // subdomain's ghost layer: it lies in a subdomain held by another rank, further out than the
+                // ghost layer reaches, or in a wedge touching a degenerate corner. `cell` still holds the last
+                // wedge that was accepted (in `cur_sd`), so interpolate at the point of that wedge closest to the
+                // departure point: a bounded, first-order error, rather than leaving the node un-advected for a
+                // whole timestep.
                 {
                     ScalarType xi = 0, eta = 0, zeta = 0;
                     sl::clamp_to_wedge( X, cur_sd, cell, lateral, radii_g, xi, eta, zeta );
