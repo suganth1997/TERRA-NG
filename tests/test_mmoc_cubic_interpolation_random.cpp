@@ -8,6 +8,13 @@
 // arbitrary position inside it, including every diamond edge and every 5-valent corner. It is the
 // interpolation error of the scheme with nothing else mixed in: no timestep, no trajectory, no accumulation.
 //
+// The fields live in the grid's own Grid4DDataScalar / Grid5DDataScalar containers and the sweep runs as a
+// Kokkos::parallel_for over the dofs in the default execution space, so on a CUDA build every sample is
+// located and evaluated on the GPU -- one thread per departure point, neighbouring threads searching
+// different subdomains, walking different numbers of steps and sliding different stencil windows, which is
+// the divergence the transport kernel actually runs into. Only the per-sample results come back; every
+// assertion is made on the host, where a failure can name the dof that caused it.
+//
 // Four evaluators run on each sample, so the table says where the error comes from:
 //
 //   q1             the second-order evaluation the cubic replaces -- the control.
@@ -43,6 +50,9 @@
 // the stencil is slid inwards and goes one-sided), and a max. The max is printed rather than asserted: it is
 // owned by the few cells at the diamond corners, where the index map is irregular by construction.
 //
+// The figures quoted above were measured on the host; a device run may move the last digit, since nvcc
+// contracts multiply-adds into FMAs where the host compiler does not. Nothing asserted here is that sharp.
+//
 // Single rank only (registered at np=1): with no ghost layer, a point displaced off a diamond has to be found
 // in another *local* subdomain, which needs all ten present.
 
@@ -57,6 +67,7 @@
 #include <mpi.h>
 
 #include "fe/wedge/sl/point_location.hpp"
+#include "terra/grid/grid_types.hpp"
 #include "terra/grid/shell/spherical_shell.hpp"
 #include "terra/kokkos/kokkos_wrapper.hpp"
 #include "util/init.hpp"
@@ -93,9 +104,9 @@ std::string fmt( const ScalarType x )
 ///
 /// Read in two different coordinate systems, see \ref FieldKind. Its three arguments are of comparable range
 /// either way, so the two readings have derivatives of comparable size and their errors may be compared.
-ScalarType smooth_formula( const ScalarType a, const ScalarType b, const ScalarType c )
+KOKKOS_INLINE_FUNCTION ScalarType smooth_formula( const ScalarType a, const ScalarType b, const ScalarType c )
 {
-    return 1.0 + std::sin( 3.0 * a ) * std::cos( 2.0 * b + 0.4 ) + 0.5 * std::exp( -2.0 * c * c );
+    return 1.0 + Kokkos::sin( 3.0 * a ) * Kokkos::cos( 2.0 * b + 0.4 ) + 0.5 * Kokkos::exp( -2.0 * c * c );
 }
 
 /// @brief Which coordinates the sampled field is a smooth function of.
@@ -125,11 +136,11 @@ struct Variant
     bool        clip;
 };
 
-constexpr int   num_variants           = 4;
-const Variant   variants[num_variants] = { { "q1", 0, false },
-                                           { "cubic", fe::wedge::sl::cubic_stencil_size, false },
-                                           { "cubic+clip", fe::wedge::sl::cubic_stencil_size, true },
-                                           { "quintic+clip", fe::wedge::sl::quintic_stencil_size, true } };
+constexpr int num_variants           = 4;
+const Variant variants[num_variants] = { { "q1", 0, false },
+                                         { "cubic", fe::wedge::sl::cubic_stencil_size, false },
+                                         { "cubic+clip", fe::wedge::sl::cubic_stencil_size, true },
+                                         { "quintic+clip", fe::wedge::sl::quintic_stencil_size, true } };
 
 /// @brief Error accumulator for one variant, split into all samples and the near-edge ones.
 struct Stats
@@ -191,10 +202,12 @@ LevelResult run_level( const int level, const FieldKind kind, const ScalarType p
     const auto domain = grid::shell::DistributedDomain::create_uniform_single_subdomain_per_diamond(
         level, level, r_min, r_max );
 
-    auto coords_shell = Kokkos::create_mirror_view_and_copy(
-        Kokkos::HostSpace{}, grid::shell::subdomain_unit_sphere_single_shell_coords< ScalarType >( domain ) );
-    auto coords_radii = Kokkos::create_mirror_view_and_copy(
-        Kokkos::HostSpace{}, grid::shell::subdomain_shell_radii< ScalarType >( domain ) );
+    // Device-resident, straight from the grid; the host mirrors are for building the fields and the sample.
+    const auto coords_shell = grid::shell::subdomain_unit_sphere_single_shell_coords< ScalarType >( domain );
+    const auto coords_radii = grid::shell::subdomain_shell_radii< ScalarType >( domain );
+
+    auto coords_shell_h = Kokkos::create_mirror_view_and_copy( Kokkos::HostSpace{}, coords_shell );
+    auto coords_radii_h = Kokkos::create_mirror_view_and_copy( Kokkos::HostSpace{}, coords_radii );
 
     const int num_subdomains = static_cast< int >( domain.subdomains().size() );
     const int num_nodes_lat  = domain.domain_info().subdomain_num_nodes_per_side_laterally();
@@ -204,23 +217,26 @@ LevelResult run_level( const int level, const FieldKind kind, const ScalarType p
     const auto        box     = fe::wedge::sl::corner_box_from_bounds( bounds );
     const auto        stencil = fe::wedge::sl::full_stencil_bounds( bounds );
 
-    // No ghost layer on these plain subdomain views, so every node carries usable geometry.
-    Kokkos::View< uint8_t***, Kokkos::HostSpace > valid( "valid", num_subdomains, num_nodes_lat, num_nodes_lat );
+    // No ghost layer on these plain subdomain fields, so every node carries usable geometry.
+    grid::Grid3DDataScalar< uint8_t > valid( "valid", num_subdomains, num_nodes_lat, num_nodes_lat );
     Kokkos::deep_copy( valid, static_cast< uint8_t >( 1 ) );
 
-    Kokkos::View< ScalarType****, Kokkos::HostSpace > field(
+    grid::Grid4DDataScalar< ScalarType > field(
         "field", num_subdomains, num_nodes_lat, num_nodes_lat, num_nodes_rad );
 
     // The unit-sphere node map, laid out so that the same evaluator can reconstruct it. It does not depend on
     // the radial index; the radial sweep over constant data is exact, so what comes back is the lateral map
     // alone. Reconstructing the geometry a field is defined on is how the lateral error below is measured.
-    Kokkos::View< ScalarType*****, Kokkos::HostSpace > unit_map(
+    grid::Grid5DDataScalar< ScalarType > unit_map(
         "unit_map", num_subdomains, num_nodes_lat, num_nodes_lat, num_nodes_rad, 3 );
+
+    auto field_h    = Kokkos::create_mirror_view( field );
+    auto unit_map_h = Kokkos::create_mirror_view( unit_map );
 
     const auto node_position = [&]( const int sd, const int x, const int y, const int r ) {
         Vec3 p;
         for ( int d = 0; d < 3; ++d )
-            p( d ) = coords_shell( sd, x, y, d ) * coords_radii( sd, r );
+            p( d ) = coords_shell_h( sd, x, y, d ) * coords_radii_h( sd, r );
         return p;
     };
 
@@ -236,15 +252,26 @@ LevelResult run_level( const int level, const FieldKind kind, const ScalarType p
                     const Vec3 p = node_position( sd, x, y, r );
 
                     for ( int d = 0; d < 3; ++d )
-                        unit_map( sd, x, y, r, d ) = coords_shell( sd, x, y, d );
+                        unit_map_h( sd, x, y, r, d ) = coords_shell_h( sd, x, y, d );
 
-                    field( sd, x, y, r ) =
+                    field_h( sd, x, y, r ) =
                         ( kind == FieldKind::Physical )
                             ? smooth_formula( p( 0 ), p( 1 ), p( 2 ) )
                             : smooth_formula( static_cast< ScalarType >( x ) * inv_span,
                                               static_cast< ScalarType >( y ) * inv_span,
-                                              coords_radii( sd, r ) );
+                                              coords_radii_h( sd, r ) );
                 }
+
+    Kokkos::deep_copy( field, field_h );
+    Kokkos::deep_copy( unit_map, unit_map_h );
+
+    // ---- the sample ----------------------------------------------------------------------------------------
+    // Drawn on the host and copied down, so the sample does not depend on the backend and a failing dof is
+    // reproducible from the index printed with it.
+    const int num_samples = num_subdomains * num_nodes_lat * num_nodes_lat * num_nodes_rad;
+
+    grid::Grid2DDataScalar< ScalarType > points( "points", num_samples, 3 );
+    auto                                 points_h = Kokkos::create_mirror_view( points );
 
     // The displacement radius, in units of the smallest cell dimension: laterally the shortest edge is the one
     // at the CMB, radially the layers are uniform here.
@@ -252,110 +279,173 @@ LevelResult run_level( const int level, const FieldKind kind, const ScalarType p
     const ScalarType h_rad = ( r_max - r_min ) / static_cast< ScalarType >( num_nodes_rad - 1 );
     const ScalarType perturb_radius = perturb_fraction * std::min( h_lat, h_rad );
 
+    std::mt19937_64                              rng( 0x9E3779B97F4A7C15ull + static_cast< uint64_t >( level ) );
+    std::uniform_real_distribution< ScalarType > uniform( 0.0, 1.0 );
+
+    for ( int idx = 0; idx < num_samples; ++idx )
+    {
+        const int sd  = idx / ( num_nodes_lat * num_nodes_lat * num_nodes_rad );
+        const int rem = idx % ( num_nodes_lat * num_nodes_lat * num_nodes_rad );
+        const int x   = rem / ( num_nodes_lat * num_nodes_rad );
+        const int y   = ( rem / num_nodes_rad ) % num_nodes_lat;
+        const int r   = rem % num_nodes_rad;
+
+        // Uniform in the ball: a uniform direction with radius R * u^(1/3).
+        const ScalarType z    = 2.0 * uniform( rng ) - 1.0;
+        const ScalarType phi  = 2.0 * M_PI * uniform( rng );
+        const ScalarType s    = std::sqrt( std::max( 0.0, 1.0 - z * z ) );
+        const ScalarType dist = perturb_radius * std::cbrt( uniform( rng ) );
+
+        const Vec3 X0 = node_position( sd, x, y, r );
+        Vec3       X;
+        X( 0 ) = X0( 0 ) + dist * s * std::cos( phi );
+        X( 1 ) = X0( 1 ) + dist * s * std::sin( phi );
+        X( 2 ) = X0( 2 ) + dist * z;
+
+        // A dof on the CMB or on the surface is displaced straight through the boundary half the time. The
+        // location would then be radially clamped while the analytic value is not, and the comparison would
+        // measure the clamp rather than the interpolation; pulling the sample back onto the boundary shell
+        // keeps it honest.
+        const ScalarType radius = X.norm();
+        const ScalarType inside = std::min( std::max( radius, r_min ), r_max );
+        if ( inside != radius )
+            X = X * ( inside / radius );
+
+        for ( int d = 0; d < 3; ++d )
+            points_h( idx, d ) = X( d );
+    }
+    Kokkos::deep_copy( points, points_h );
+
+    // ---- the sweep -----------------------------------------------------------------------------------------
+    // One thread per displaced dof. Per-sample results are stored rather than reduced: the kernel stays a
+    // straight location-and-evaluate, and the statistics -- which need the dof a value came from, not just the
+    // value -- are formed on the host below.
+    grid::Grid2DDataScalar< ScalarType > errors( "errors", num_samples, num_variants );
+    grid::Grid1DDataScalar< ScalarType > map_error( "map_error", num_samples );
+    grid::Grid1DDataScalar< int >        edge_dist( "edge_dist", num_samples );
+    grid::Grid1DDataScalar< int >        found( "found", num_samples );
+    grid::Grid1DDataScalar< int >        clip_hit( "clip_hit", num_samples );
+
+    // The variant table, in a form a device lambda can capture.
+    Kokkos::Array< int, num_variants > width{};
+    Kokkos::Array< int, num_variants > clip{};
+    for ( int v = 0; v < num_variants; ++v )
+    {
+        width[v] = variants[v].width;
+        clip[v]  = variants[v].clip ? 1 : 0;
+    }
+
     // The same budgets the rest of the direct-location tests use.
     const int        direct_max_refinements = 2;
     const int        direct_max_walk_steps  = 4;
     const ScalarType eps                    = 1e-12;
 
-    // Fixed seed: a failing sample has to be reproducible from the dof printed with the failure.
-    std::mt19937_64                              rng( 0x9E3779B97F4A7C15ull + static_cast< uint64_t >( level ) );
-    std::uniform_real_distribution< ScalarType > uniform( 0.0, 1.0 );
+    const int nlat = num_nodes_lat;
+    const int nrad = num_nodes_rad;
+    const int nsub = num_subdomains;
+
+    Kokkos::parallel_for(
+        "mmoc_cubic_random_samples",
+        Kokkos::RangePolicy<>( 0, num_samples ),
+        KOKKOS_LAMBDA( const int idx ) {
+            const int sd = idx / ( nlat * nlat * nrad );
+
+            Vec3 X;
+            for ( int d = 0; d < 3; ++d )
+                X( d ) = points( idx, d );
+
+            // Exactly how the transport finds a departure point: the owning subdomain is not assumed.
+            int        sd_found = -1;
+            const auto res      = fe::wedge::sl::locate_point_in_local_subdomains(
+                X, sd, nsub, coords_shell, coords_radii, box, bounds, direct_max_refinements,
+                direct_max_walk_steps, eps, /*clamp_radially=*/true, r_min, r_max, valid, sd_found );
+
+            found( idx ) = res.found ? 1 : 0;
+            if ( !res.found )
+                return;
+
+            // And exactly how it evaluates there: the radial cell and zeta come from the point's true radius,
+            // not from the wedge's parametric one.
+            WedgeCell  cell = res.cell;
+            ScalarType zeta = res.zeta;
+            fe::wedge::sl::radial_coords_from_radius(
+                sd_found, X.norm(), coords_radii, nrad - 1, r_min, r_max, cell.r, zeta );
+
+            // The coordinates the evaluator will actually interpolate at.
+            ScalarType u = 0.0, v = 0.0;
+            fe::wedge::sl::wedge_lateral_index_coords( cell, res.xi, res.eta, u, v );
+            const ScalarType rho =
+                fe::wedge::sl::wedge_radius_from_zeta( sd_found, cell, coords_radii, zeta );
+
+            const ScalarType exact = ( kind == FieldKind::Physical )
+                                         ? smooth_formula( X( 0 ), X( 1 ), X( 2 ) )
+                                         : smooth_formula( u * inv_span, v * inv_span, rho );
+
+            edge_dist( idx ) = Kokkos::min( Kokkos::min( cell.x, cell.y ),
+                                            Kokkos::min( nlat - 2 - cell.x, nlat - 2 - cell.y ) );
+
+            ScalarType value[num_variants];
+            for ( int vi = 0; vi < num_variants; ++vi )
+            {
+                value[vi] = ( width[vi] == 0 )
+                                ? fe::wedge::sl::evaluate_q1_scalar(
+                                      field, sd_found, cell, res.xi, res.eta, zeta )
+                                : fe::wedge::sl::evaluate_cubic_scalar(
+                                      field, sd_found, cell, res.xi, res.eta, zeta, coords_radii, stencil,
+                                      valid, clip[vi] != 0, /*limit_slopes=*/false, width[vi] );
+
+                errors( idx, vi ) = Kokkos::abs( value[vi] - exact );
+            }
+
+            // Variants 1 and 2 differ only in the clip, so this flags the samples it bites on.
+            clip_hit( idx ) = ( Kokkos::abs( value[2] - value[1] ) > 1e-14 ) ? 1 : 0;
+
+            // Where the nodal map itself puts the lateral index coordinates this sample arrived with, against
+            // where the sample actually is. The reconstruction interpolates data that lives on the curved map,
+            // while the coordinates come from the flat chord triangle of the located wedge, and the gap
+            // between the two is an error in the *evaluation point* that no amount of interpolation order can
+            // remove: it enters any field as |grad f| times this.
+            const auto p_map = fe::wedge::sl::evaluate_cubic_vec< ScalarType, 3 >(
+                unit_map, sd_found, cell, res.xi, res.eta, zeta, coords_radii, stencil, valid, false );
+
+            const Vec3 dir      = X * ( 1.0 / X.norm() );
+            ScalarType mismatch = 0.0;
+            for ( int d = 0; d < 3; ++d )
+                mismatch += ( p_map( d ) - dir( d ) ) * ( p_map( d ) - dir( d ) );
+            map_error( idx ) = Kokkos::sqrt( mismatch );
+        } );
+    Kokkos::fence();
+
+    // ---- the statistics ------------------------------------------------------------------------------------
+    auto errors_h    = Kokkos::create_mirror_view_and_copy( Kokkos::HostSpace{}, errors );
+    auto map_error_h = Kokkos::create_mirror_view_and_copy( Kokkos::HostSpace{}, map_error );
+    auto edge_dist_h = Kokkos::create_mirror_view_and_copy( Kokkos::HostSpace{}, edge_dist );
+    auto found_h     = Kokkos::create_mirror_view_and_copy( Kokkos::HostSpace{}, found );
+    auto clip_hit_h  = Kokkos::create_mirror_view_and_copy( Kokkos::HostSpace{}, clip_hit );
 
     LevelResult out;
+    out.samples = num_samples;
 
-    for ( int sd = 0; sd < num_subdomains; ++sd )
-        for ( int x = 0; x < num_nodes_lat; ++x )
-            for ( int y = 0; y < num_nodes_lat; ++y )
-                for ( int r = 0; r < num_nodes_rad; ++r )
-                {
-                    // Uniform in the ball: a uniform direction with radius R * u^(1/3).
-                    const ScalarType z    = 2.0 * uniform( rng ) - 1.0;
-                    const ScalarType phi  = 2.0 * M_PI * uniform( rng );
-                    const ScalarType s    = std::sqrt( std::max( 0.0, 1.0 - z * z ) );
-                    const ScalarType dist = perturb_radius * std::cbrt( uniform( rng ) );
+    for ( int idx = 0; idx < num_samples; ++idx )
+    {
+        const int sd  = idx / ( num_nodes_lat * num_nodes_lat * num_nodes_rad );
+        const int rem = idx % ( num_nodes_lat * num_nodes_lat * num_nodes_rad );
+        const int x   = rem / ( num_nodes_lat * num_nodes_rad );
+        const int y   = ( rem / num_nodes_rad ) % num_nodes_lat;
+        const int r   = rem % num_nodes_rad;
 
-                    const Vec3 X0 = node_position( sd, x, y, r );
-                    Vec3       X;
-                    X( 0 ) = X0( 0 ) + dist * s * std::cos( phi );
-                    X( 1 ) = X0( 1 ) + dist * s * std::sin( phi );
-                    X( 2 ) = X0( 2 ) + dist * z;
+        if ( found_h( idx ) == 0 )
+        {
+            ++out.escaped;
+            continue;
+        }
 
-                    // A dof on the CMB or on the surface is displaced straight through the boundary half the
-                    // time. The location would then be radially clamped while the analytic value is not, and
-                    // the comparison would measure the clamp rather than the interpolation; pulling the sample
-                    // back onto the boundary shell keeps it honest.
-                    const ScalarType radius = X.norm();
-                    const ScalarType inside = std::min( std::max( radius, r_min ), r_max );
-                    if ( inside != radius )
-                        X = X * ( inside / radius );
+        for ( int v = 0; v < num_variants; ++v )
+            out.stats[v].add( errors_h( idx, v ), edge_dist_h( idx ), sd, x, y, r );
 
-                    ++out.samples;
-
-                    // Exactly how the transport finds a departure point: the owning subdomain is not assumed.
-                    int        sd_found = -1;
-                    const auto res      = fe::wedge::sl::locate_point_in_local_subdomains(
-                        X, sd, num_subdomains, coords_shell, coords_radii, box, bounds, direct_max_refinements,
-                        direct_max_walk_steps, eps, /*clamp_radially=*/true, r_min, r_max, valid, sd_found );
-
-                    if ( !res.found )
-                    {
-                        ++out.escaped;
-                        continue;
-                    }
-
-                    // And exactly how it evaluates there: the radial cell and zeta come from the point's true
-                    // radius, not from the wedge's parametric one.
-                    WedgeCell  cell = res.cell;
-                    ScalarType zeta = res.zeta;
-                    fe::wedge::sl::radial_coords_from_radius(
-                        sd_found, X.norm(), coords_radii, num_nodes_rad - 1, r_min, r_max, cell.r, zeta );
-
-                    // The coordinates the evaluator will actually interpolate at.
-                    ScalarType u = 0.0, v = 0.0;
-                    fe::wedge::sl::wedge_lateral_index_coords( cell, res.xi, res.eta, u, v );
-                    const ScalarType rho =
-                        fe::wedge::sl::wedge_radius_from_zeta( sd_found, cell, coords_radii, zeta );
-
-                    const ScalarType exact = ( kind == FieldKind::Physical )
-                                                 ? smooth_formula( X( 0 ), X( 1 ), X( 2 ) )
-                                                 : smooth_formula( u * inv_span, v * inv_span, rho );
-
-                    const int edge_dist =
-                        std::min( std::min( cell.x, cell.y ),
-                                  std::min( num_nodes_lat - 2 - cell.x, num_nodes_lat - 2 - cell.y ) );
-
-                    ScalarType value[num_variants];
-                    for ( int v = 0; v < num_variants; ++v )
-                    {
-                        value[v] = ( variants[v].width == 0 )
-                                       ? fe::wedge::sl::evaluate_q1_scalar(
-                                             field, sd_found, cell, res.xi, res.eta, zeta )
-                                       : fe::wedge::sl::evaluate_cubic_scalar(
-                                             field, sd_found, cell, res.xi, res.eta, zeta, coords_radii,
-                                             stencil, valid, variants[v].clip, /*limit_slopes=*/false,
-                                             variants[v].width );
-
-                        out.stats[v].add( std::abs( value[v] - exact ), edge_dist, sd, x, y, r );
-                    }
-
-                    // Where the nodal map itself puts the lateral index coordinates this sample arrived
-                    // with, against where the sample actually is. The reconstruction interpolates data that
-                    // lives on the curved map, while the coordinates come from the flat chord triangle of the
-                    // located wedge, and the gap between the two is an error in the *evaluation point* that no
-                    // amount of interpolation order can remove: it enters any field as |grad f| times this.
-                    const auto p_map = fe::wedge::sl::evaluate_cubic_vec< ScalarType, 3 >(
-                        unit_map, sd_found, cell, res.xi, res.eta, zeta, coords_radii, stencil, valid, false );
-
-                    const Vec3 dir = X * ( 1.0 / X.norm() );
-                    ScalarType mismatch = 0.0;
-                    for ( int d = 0; d < 3; ++d )
-                        mismatch += ( p_map( d ) - dir( d ) ) * ( p_map( d ) - dir( d ) );
-                    out.map_mismatch.add( std::sqrt( mismatch ), edge_dist, sd, x, y, r );
-
-                    // Variants 1 and 2 differ only in the clip, so this counts the samples it bites on.
-                    if ( std::abs( value[2] - value[1] ) > 1e-14 )
-                        ++out.clipped;
-                }
+        out.map_mismatch.add( map_error_h( idx ), edge_dist_h( idx ), sd, x, y, r );
+        out.clipped += clip_hit_h( idx );
+    }
 
     return out;
 }
@@ -383,11 +473,11 @@ void print_level( const int level, const LevelResult& res )
 }
 
 /// @brief Sweeps one field kind at two levels, prints both tables and the observed convergence orders.
-void sweep( const FieldKind        kind,
-            const int              coarse,
-            const int              fine,
-            const ScalarType       perturb_fraction,
-            LevelResult&           res_fine_out,
+void sweep( const FieldKind  kind,
+            const int        coarse,
+            const int        fine,
+            const ScalarType perturb_fraction,
+            LevelResult&     res_fine_out,
             ScalarType ( &order )[num_variants] )
 {
     std::cout << field_kind_name( kind ) << ":" << std::endl;
