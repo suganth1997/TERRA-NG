@@ -512,10 +512,10 @@ int main( int argc, char** argv )
 
     // Three quarters of a cell: far enough from the node that the reconstruction is doing real work, close
     // enough that the sample stays in the node's own neighbourhood.
-    const ScalarType perturb_fraction = 0.75;
+    const ScalarType perturb_fraction = 10.0;
 
-    const int coarse = 3;
-    const int fine   = 4;
+    const int coarse = 5;
+    const int fine   = 6;
 
     LevelResult index_fine, physical_fine;
     ScalarType  index_order[num_variants], physical_order[num_variants];
