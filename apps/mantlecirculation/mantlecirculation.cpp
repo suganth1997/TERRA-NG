@@ -179,7 +179,7 @@ Result<> run( const Parameters& prm )
     // Optional 3-D density field for PDA
     // Density is needed in Stokes and energy -- so we set it up here
     std::optional< VectorQ1Scalar< ScalarType > > density;
-    // if ( pda_form )
+    if ( pda_form )
     {
         density.emplace( "density", ( *domains[velocity_level] ), ownership_mask_data[velocity_level] );
     }
@@ -265,12 +265,6 @@ Result<> run( const Parameters& prm )
             RadialProfileToQ1{ density->grid_data(), rho_profile } );
         Kokkos::fence();
     }
-
-    Kokkos::parallel_for(
-        "RadialProfileToQ1",
-        grid::shell::local_domain_md_range_policy_nodes( *domains[velocity_level] ),
-        RadialProfileToQ1{ density->grid_data(), rho_profile } );
-    Kokkos::fence();
 
     // Setting up Stokes velocity boundary conditions.
     //
@@ -367,7 +361,7 @@ Result<> run( const Parameters& prm )
     xdmf_output->add( Tdev.grid_data() );              // Temperature deviation
     xdmf_output->add( u.block_1().grid_data() );       // Velocity
     xdmf_output->add( stokes.eta_fine().grid_data() ); // Viscosity
-    // if ( pda_form )
+    if ( pda_form )
     {
         xdmf_output->add( density->grid_data() ); // Density
     }

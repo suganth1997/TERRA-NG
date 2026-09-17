@@ -1,7 +1,7 @@
 #include "../src/terra/communication/shell/communication.hpp"
 #include "fe/strong_algebraic_dirichlet_enforcement.hpp"
 #include "fe/wedge/integrands.hpp"
-#include "fe/wedge/operators/shell/shear_heating_simple.hpp"
+#include "fe/wedge/linearforms/shell/shear_heating_term.hpp"
 #include "linalg/solvers/pcg.hpp"
 #include "linalg/solvers/richardson.hpp"
 #include "terra/dense/mat.hpp"
@@ -87,6 +87,20 @@ struct ViscosityInterpolator
     }
 };
 
+struct ShearHeatingCoefficientTest
+{
+    KOKKOS_INLINE_FUNCTION double operator()(
+        const int                     ,
+        const int                     ,
+        const int                     ,
+        const int                     ,
+        const int                     ,
+        const dense::Vec< double, 3 >  ) const
+    {
+        return 1.0;
+    }
+};
+
 struct TrialTestFunctionInterpolator
 {
     Grid3DDataVec< double, 3 > grid_;
@@ -141,36 +155,22 @@ int main( int argc, char** argv )
     const auto coords_shell = terra::grid::shell::subdomain_unit_sphere_single_shell_coords< ScalarType >( domain );
     const auto coords_radii = terra::grid::shell::subdomain_shell_radii< ScalarType >( domain );
 
-    VectorQ1Scalar< ScalarType > T_h( "T_h", domain, mask_data );
     VectorQ1Scalar< ScalarType > s_h( "s_h", domain, mask_data );
-
     VectorQ1Scalar< ScalarType > mu( "mu", domain, mask_data );
-
-    // VectorQ1Scalar< ScalarType > ux( "ux", domain, mask_data );
-    // VectorQ1Scalar< ScalarType > uy( "uy", domain, mask_data );
-    // VectorQ1Scalar< ScalarType > uz( "uz", domain, mask_data );
+    VectorQ1Scalar< ScalarType > f_dst( "f_dst", domain, mask_data );
 
     VectorQ1Vec< ScalarType, 3 > velocity("velocity", domain, mask_data);
 
-    VectorQ1Scalar< ScalarType > f_dst( "f_dst", domain, mask_data );
-
-    using ShearHeatingOperator = fe::wedge::operators::shell::ShearHeatingSimple< ScalarType >;
+    using ShearHeatingOperator = fe::wedge::linearforms::shell::ShearHeatingTerm< ScalarType, ShearHeatingCoefficientTest >;
 
     ShearHeatingOperator shear_heating_operator(
         domain,
         coords_shell,
         coords_radii,
-        mu.grid_data(),
-        velocity.grid_data()
-        // ux.grid_data(),
-        // uy.grid_data(),
-        // uz.grid_data() 
+        mu,
+        velocity,
+        ShearHeatingCoefficientTest()
     );
-
-    Kokkos::parallel_for(
-        "u_interpolation",
-        local_domain_md_range_policy_nodes( domain ),
-        TrialTestFunctionInterpolator( coords_shell, coords_radii, T_h.grid_data(), false ) );
 
     Kokkos::parallel_for(
         "v_interpolation",
@@ -187,22 +187,7 @@ int main( int argc, char** argv )
         local_domain_md_range_policy_nodes( domain ),
         VelocityInterpolator( coords_shell, coords_radii, velocity.grid_data(), false ) );
 
-    // Kokkos::parallel_for(
-    //     "ux_interpolation",
-    //     local_domain_md_range_policy_nodes( domain ),
-    //     UxInterpolator( coords_shell, coords_radii, ux.grid_data(), false ) );
-
-    // Kokkos::parallel_for(
-    //     "uy_interpolation",
-    //     local_domain_md_range_policy_nodes( domain ),
-    //     UyInterpolator( coords_shell, coords_radii, uy.grid_data(), false ) );
-
-    // Kokkos::parallel_for(
-    //     "uz_interpolation",
-    //     local_domain_md_range_policy_nodes( domain ),
-    //     UzInterpolator( coords_shell, coords_radii, uz.grid_data(), false ) );
-
-    linalg::apply( shear_heating_operator, T_h, f_dst );
+    linalg::apply( shear_heating_operator, f_dst );
 
     const auto shear_heating_integral_analytical =
         14.5 * ( 4.0 / 5.0 ) * M_PI * ( rMax * rMax * rMax * rMax * rMax - rMin * rMin * rMin * rMin * rMin );
