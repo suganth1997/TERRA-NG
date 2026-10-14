@@ -783,6 +783,17 @@ class StokesContext
     {
         util::Timer timer_stokes( "stokes" );
 
+        // Recompute the fine-level smoother inverse diagonal (fine eta may have changed).
+        if ( prm_.stokes_solver_parameters.mg_precision == MGPrecision::DOUBLE &&
+             prm_.physics_parameters.viscosity_parameters.law != ViscosityLaw::CONSTANT )
+        {
+            linalg::assign( tmp_mg_.back(), ScalarType( 1 ) );
+            K_->block_11().set_diagonal( true );
+            linalg::apply( K_->block_11(), tmp_mg_.back(), inverse_diagonals_.back() );
+            K_->block_11().set_diagonal( false );
+            linalg::invert_entries( inverse_diagonals_.back() );
+        }
+
         util::logroot << "Setting up Stokes rhs ..." << std::endl;
 
         Kokkos::parallel_for(
