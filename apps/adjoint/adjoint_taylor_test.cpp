@@ -24,12 +24,17 @@
 ///   --frozen-velocity 1: the perturbed runs reuse the base run's velocities. The adjoint is then exact: rate 2.
 ///   --frozen-velocity 0: the perturbed runs re-solve Stokes (the reference's setting). The adjoint ignores the
 ///                        buoyancy feedback, so the remainder only falls at O(h) once that error dominates.
+///
+/// --mmoc 1: the forward energy step is the MMOC step of the mantle-circulation app (MMOCSolver): transport along the
+///           characteristics of u^n (MMOCTransport), then the implicit Galerkin diffusion solve (M + dt K) T^{n+1} =
+///           M T*. The adjoint is unchanged (transposed implicit step), so it is not the adjoint of this forward model.
 
 #include <cmath>
 #include <cstdio>
 #include <fstream>
 #include <functional>
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -37,6 +42,7 @@
 #include "fe/wedge/operators/shell/epsilon_divdiv_stokes.hpp"
 #include "fe/wedge/operators/shell/kmass.hpp"
 #include "fe/wedge/operators/shell/mass.hpp"
+#include "fe/wedge/operators/shell/mmoc_transport.hpp"
 #include "fe/wedge/operators/shell/prolongation_constant.hpp"
 #include "fe/wedge/operators/shell/restriction_constant.hpp"
 #include "fe/wedge/operators/shell/unsteady_advection_diffusion_supg.hpp"
@@ -101,6 +107,7 @@ struct Parameters
     int    taylor         = 1;     // run the Taylor test
     int    adjoint_stokes = 0;     // 1: include the buoyancy feedback (adjoint Stokes solve per step)
     int    supg           = 1;     // 0: pure Galerkin energy step (then the coupled adjoint is exact)
+    int    mmoc           = 0;     // 1: forward energy step = MMOC transport + implicit Galerkin diffusion
 };
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -482,11 +489,30 @@ int run( const Parameters& prm )
     linalg::solvers::PBiCGStab< Energy > bicg(
         2, linalg::solvers::IterativeSolverParameters{ 500, prm.energy_tol, 1e-30 }, table, bicg_tmp );
 
+    // --mmoc 1: diffusion-only operators (zero velocity, SUPG off) and the characteristic transport, as in MMOCSolver.
+    VectorW1Vec< Real > u_zero( "u_zero", dom, owner[vl] );
+    linalg::assign( u_zero, 0.0 );
+    Energy D( dom, coords[vl], radii[vl], bmask[vl], u_zero, prm.kappa, prm.dt, true );
+    Energy D_neu( dom, coords[vl], radii[vl], bmask[vl], u_zero, prm.kappa, prm.dt, false );
+    Energy D_neu_diag( dom, coords[vl], radii[vl], bmask[vl], u_zero, prm.kappa, prm.dt, false, true );
+    D.set_supg_enabled( false );
+    D_neu.set_supg_enabled( false );
+    D_neu_diag.set_supg_enabled( false );
+    std::optional< fe::wedge::operators::shell::MMOCTransport< Real > > mmoc;
+    if ( prm.mmoc )
+        mmoc.emplace( dom, owner[vl] ); // RK4 tracing, quintic reconstruction (the app's settings)
+
     /// T <- E(vel) T : one implicit step with T = 1 / 0 imposed at CMB / surface.
+    /// --mmoc 1: T <- D^-1 M A(vel) T, A the MMOC transport with u^n held over the step, D = M + dt K.
     auto energy_step = [&]( VectorW1Scalar< Real >& T ) {
+        if ( prm.mmoc )
+            mmoc->step( T, vel, vel, prm.dt, 1 ); // one substep: substeps refine the trajectory only (accuracy)
+        Energy& L      = prm.mmoc ? D : E;
+        Energy& L_neu  = prm.mmoc ? D_neu : E_neu;
+        Energy& L_diag = prm.mmoc ? D_neu_diag : E_neu_diag;
         linalg::apply( M, T, rhs );
-        fe::strong_algebraic_dirichlet_enforcement_poisson_like( E_neu, E_neu_diag, g_bc, tmp, rhs, bmask[vl], BOUNDARY );
-        linalg::solvers::solve( bicg, E, T, rhs );
+        fe::strong_algebraic_dirichlet_enforcement_poisson_like( L_neu, L_diag, g_bc, tmp, rhs, bmask[vl], BOUNDARY );
+        linalg::solvers::solve( bicg, L, T, rhs );
         table->clear();
     };
 
@@ -664,6 +690,8 @@ int run( const Parameters& prm )
     // 4) Taylor remainder test
     util::logroot << "Adjoint: " << ( prm.adjoint_stokes ? "with adjoint Stokes (buoyancy feedback)" : "velocity held fixed" )
                   << ", energy step " << ( prm.supg ? "SUPG (tau held fixed in the adjoint)" : "Galerkin" ) << "\n";
+    if ( prm.mmoc )
+        util::logroot << "Forward energy step: MMOC transport + implicit diffusion (the adjoint above is not its adjoint)\n";
     util::logroot << "Taylor test, " << ( prm.frozen ? "perturbed runs reuse the base velocities (exact adjoint)"
                                                       : "perturbed runs re-solve Stokes (adjoint ignores buoyancy)" )
                   << "\n";
@@ -716,6 +744,8 @@ int main( int argc, char** argv )
     util::add_option_with_default( app, "--adjoint-stokes", prm.adjoint_stokes,
                                    "1: include the buoyancy feedback via an adjoint Stokes solve per step." );
     util::add_option_with_default( app, "--supg", prm.supg, "1: SUPG energy step; 0: pure Galerkin." );
+    util::add_option_with_default( app, "--mmoc", prm.mmoc,
+                                   "1: forward energy step = MMOC transport + implicit diffusion (adjoint unchanged)." );
     CLI11_PARSE( app, argc, argv );
 
     return run( prm );
